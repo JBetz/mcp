@@ -27,7 +27,7 @@ module MCP.Server.HTTP.Internal (
 import Control.Concurrent.MVar
 import Control.Monad (when)
 import Control.Monad.Except
-import Control.Monad.State.Lazy
+import Control.Monad.Reader
 import Data.Aeson (encode, object, toJSON, (.=))
 import Data.Aeson qualified as Aeson
 import Data.ByteString.Lazy.Char8 qualified as BSL
@@ -70,10 +70,6 @@ instance MimeRender JSONRPCEvent JSONRPCMessage where
 Both 'MCP.Server.HTTP.handleMCPRequest' and
 'MCP.Server.SimpleHTTP.handleSimpleHTTPRequest' delegate here after
 performing their own authentication checks.
-
-When @mb_user@ is @'Just' user@, the server calls @mcp_handler_init user@
-on the first @initialize@ request (JWT\/HTTP transport).  When @'Nothing'@,
-the init hook is skipped (SimpleHTTP \/ Stdio convention).
 -}
 handleMCPRequestCore ::
     MVar MCPServerState ->
@@ -129,7 +125,7 @@ handleMCPRequestCore state_var mb_user request_value =
                 -- Validate request ID
                 when (not $ isValidRequestId req_id) $
                     throwError err400{errBody = "Invalid request ID, must be string, number, or null"}
-
+                
                 -- Initialize handler state on first initialize request
                 -- (only when an authenticated user is available)
                 case mb_user of
@@ -146,13 +142,9 @@ handleMCPRequestCore state_var mb_user request_value =
                                                 h_st' <- handler_init auth_user handler_st
                                                 return cur_st{mcp_handler_state = h_st'}
                     Nothing -> return ()
-
                 -- Process the request routing to the appropriate handler.
-                -- Set mcp_current_user while the handler runs, then clear it
-                -- before releasing the shared state. Handlers read this via
-                -- getCurrentUser.
-                res <- liftIO $ modifyMVar state_var $
-                    runWithCurrentUser (processMethod server_initialized method params)
+                let requestState = MCPRequestState mb_user state_var
+                res <- liftIO $ runReaderT (processMethod server_initialized method params) requestState
 
                 -- Log the response if debug level
                 cur_log_level <- liftIO $ mcp_log_level <$> readMVar state_var
@@ -217,12 +209,10 @@ handleMCPRequestCore state_var mb_user request_value =
                     Yield msg $
                         Effect $ do
                             ci_resp <- liftIO $ takeMVar mvar
+                            let requestState = MCPRequestState mb_user state_var
                             result <-
                                 liftIO $
-                                    modifyMVar state_var $
-                                        runWithCurrentUser $
-                                            runExceptT $
-                                                ci_cont ci_resp
+                                    runReaderT (runExceptT $ ci_cont ci_resp) requestState
                             case result of
                                 Left err -> do
                                     return $ Source.Error $ T.unpack err
@@ -233,9 +223,3 @@ handleMCPRequestCore state_var mb_user request_value =
                     flip Yield Stop $
                         ResponseMessage $
                             JSONRPCResponse rPC_VERSION req_id (recurReplaceMeta $ toJSON response)
-
-    runWithCurrentUser :: StateT MCPServerState IO a -> MCPServerState -> IO (MCPServerState, a)
-    runWithCurrentUser action cur_st = do
-        let cur_st_with_user = cur_st{mcp_current_user = mb_user}
-        (result, final_st) <- runStateT action cur_st_with_user
-        pure (final_st{mcp_current_user = Nothing}, result)
