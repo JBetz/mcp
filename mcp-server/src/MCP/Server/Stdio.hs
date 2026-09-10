@@ -19,8 +19,9 @@ module MCP.Server.Stdio (
     serveStdio,
 ) where
 
+import Control.Concurrent.MVar (newMVar, readMVar)
 import Control.Monad.Except
-import Control.Monad.State.Lazy
+import Control.Monad.Reader
 import Data.Aeson (encode)
 import Data.Aeson qualified as Aeson
 import Data.ByteString.Char8 qualified as BS
@@ -111,7 +112,9 @@ serveStdio h_in h_out initial_state = do
                             let initialized = mcp_server_initialized cur_st
 
                             -- Process the request
-                            (res, new_st) <- runStateT (processMethod initialized method params) cur_st
+                            stateMVar <- newMVar cur_st
+                            res <- runReaderT (processMethod initialized method params) (MCPRequestState Nothing stateMVar)
+                            new_st <- readMVar stateMVar
                             writeIORef state_ref new_st
 
                             -- Handle ProcessClientInput by synchronous read/write
@@ -169,7 +172,10 @@ serveStdio h_in h_out initial_state = do
                 Right (ResponseMessage (JSONRPCResponse _ _ result)) -> do
                     -- Run the continuation with the client's response
                     cur_st <- readIORef state_ref
-                    (cont_result, new_st) <- runStateT (runExceptT $ ci_cont result) cur_st
+                    stateMVar <- newMVar cur_st
+                    let requestState = MCPRequestState Nothing stateMVar
+                    cont_result <- runReaderT (runExceptT $ ci_cont result) requestState
+                    new_st <- readMVar stateMVar 
                     writeIORef state_ref new_st
                     case cont_result of
                         Left err -> return $ ProcessServerError err
